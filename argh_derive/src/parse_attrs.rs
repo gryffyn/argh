@@ -18,6 +18,8 @@ pub struct FieldAttrs {
     pub long: Option<syn::LitStr>,
     pub short: Option<syn::LitChar>,
     pub arg_name: Option<syn::LitStr>,
+    pub greedy: Option<syn::Path>,
+    pub hidden_help: bool,
 }
 
 /// The purpose of a particular field on a `#![derive(FromArgs)]` struct.
@@ -120,13 +122,17 @@ impl FieldAttrs {
                         FieldKind::Positional,
                         &mut this.field_type,
                     );
+                } else if name.is_ident("greedy") {
+                    this.greedy = Some(name.clone());
+                } else if name.is_ident("hidden_help") {
+                    this.hidden_help = true;
                 } else {
                     errors.err(
                         &meta,
                         concat!(
                             "Invalid field-level `argh` attribute\n",
-                            "Expected one of: `arg_name`, `default`, `description`, `from_str_fn`, `long`, ",
-                            "`option`, `short`, `subcommand`, `switch`",
+                            "Expected one of: `arg_name`, `default`, `description`, `from_str_fn`, `greedy`, ",
+                            "`long`, `option`, `short`, `subcommand`, `switch`, `hidden_help`",
                         ),
                     );
                 }
@@ -142,6 +148,16 @@ impl FieldAttrs {
                      or `#[argh(positional)]` fields",
                 ),
             }
+        }
+
+        match (&this.greedy, this.field_type.as_ref().map(|f| f.kind)) {
+            (Some(_), Some(FieldKind::Positional)) => {}
+            (Some(greedy), Some(_)) => errors.err(
+                &greedy,
+                "`greedy` may only be specified on `#[argh(positional)]` \
+                    fields",
+            ),
+            _ => {}
         }
 
         if let Some(d) = &this.description {
@@ -167,12 +183,7 @@ impl FieldAttrs {
         parse_attr_single_string(errors, m, "long", &mut self.long);
         let long = self.long.as_ref().unwrap();
         let value = long.value();
-        if !value.is_ascii() {
-            errors.err(long, "Long names must be ASCII");
-        }
-        if !value.chars().all(|c| c.is_lowercase() || c == '-') {
-            errors.err(long, "Long names must be lowercase");
-        }
+        check_long_name(errors, long, &value);
     }
 
     fn parse_attr_short(&mut self, errors: &Errors, m: &syn::MetaNameValue) {
@@ -184,6 +195,15 @@ impl FieldAttrs {
                 errors.err(lit_char, "Short names must be ASCII");
             }
         }
+    }
+}
+
+pub(crate) fn check_long_name(errors: &Errors, spanned: &impl syn::spanned::Spanned, value: &str) {
+    if !value.is_ascii() {
+        errors.err(spanned, "Long names must be ASCII");
+    }
+    if !value.chars().all(|c| c.is_lowercase() || c == '-' || c.is_ascii_digit()) {
+        errors.err(spanned, "Long names must be lowercase");
     }
 }
 
@@ -418,6 +438,62 @@ impl TypeAttrs {
     }
 }
 
+/// Represents an enum variant's attributes.
+#[derive(Default)]
+pub struct VariantAttrs {
+    pub is_dynamic: Option<syn::Path>,
+}
+
+impl VariantAttrs {
+    /// Parse enum variant `#[argh(...)]` attributes
+    pub fn parse(errors: &Errors, variant: &syn::Variant) -> Self {
+        let mut this = VariantAttrs::default();
+
+        let fields = match &variant.fields {
+            syn::Fields::Named(fields) => Some(&fields.named),
+            syn::Fields::Unnamed(fields) => Some(&fields.unnamed),
+            syn::Fields::Unit => None,
+        };
+
+        for field in fields.into_iter().flatten() {
+            for attr in &field.attrs {
+                if is_argh_attr(attr) {
+                    err_unused_enum_attr(errors, attr);
+                }
+            }
+        }
+
+        for attr in &variant.attrs {
+            let ml = if let Some(ml) = argh_attr_to_meta_list(errors, attr) {
+                ml
+            } else {
+                continue;
+            };
+
+            for meta in &ml.nested {
+                let meta = if let Some(m) = errors.expect_nested_meta(meta) { m } else { continue };
+
+                let name = meta.path();
+                if name.is_ident("dynamic") {
+                    if let Some(prev) = this.is_dynamic.as_ref() {
+                        errors.duplicate_attrs("dynamic", prev, meta);
+                    } else {
+                        this.is_dynamic = errors.expect_meta_word(meta).cloned();
+                    }
+                } else {
+                    errors.err(
+                        &meta,
+                        "Invalid variant-level `argh` attribute\n\
+                         Variants can only have the #[argh(dynamic)] attribute.",
+                    );
+                }
+            }
+        }
+
+        this
+    }
+}
+
 fn check_option_description(errors: &Errors, desc: &str, span: Span) {
     let chars = &mut desc.trim().chars();
     match (chars.next(), chars.next()) {
@@ -520,29 +596,6 @@ pub fn check_enum_type_attrs(errors: &Errors, type_attrs: &TypeAttrs, type_span:
     }
     if let Some(err_code) = error_codes.first() {
         err_unused_enum_attr(errors, &err_code.0);
-    }
-}
-
-/// Checks that an enum variant and its fields have no `#[argh(...)]` attributes.
-pub fn check_enum_variant_attrs(errors: &Errors, variant: &syn::Variant) {
-    for attr in &variant.attrs {
-        if is_argh_attr(attr) {
-            err_unused_enum_attr(errors, attr);
-        }
-    }
-
-    let fields = match &variant.fields {
-        syn::Fields::Named(fields) => &fields.named,
-        syn::Fields::Unnamed(fields) => &fields.unnamed,
-        syn::Fields::Unit => return,
-    };
-
-    for field in fields {
-        for attr in &field.attrs {
-            if is_argh_attr(attr) {
-                err_unused_enum_attr(errors, attr);
-            }
-        }
     }
 }
 
